@@ -412,7 +412,7 @@ contract AerodromeRebalancerTest is Test {
         assertNotEq(spyNpm.lastAmount1Min(), twapA1 * 9950 / 10_000, "amount1Min should not use twap");
     }
 
-    function test_zeroLiquiditySwap_handlesDustOnRequiredSide() public {
+    function test_rangeRatioSwap_handlesZeroLiquidityDustOnRequiredSide() public {
         AerodromeRebalancerHarness harness = _deployHarness(safe, address(pool), address(gaugeMock), address(npm));
 
         AerodromeRebalancer.RebalanceCtx memory ctx;
@@ -430,7 +430,7 @@ contract AerodromeRebalancerTest is Test {
         );
 
         (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut) =
-            harness.exposedZeroLiquiditySwap(ctx, b0, b1);
+            harness.exposedRangeRatioSwap(ctx, b0, b1);
 
         assertTrue(shouldSwap, "should swap surplus cbBTC");
         assertFalse(zeroForOne, "cbBTC -> WETH");
@@ -443,6 +443,37 @@ contract AerodromeRebalancerTest is Test {
             LiquidityAmounts.getLiquidityForAmounts(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1),
             0,
             "post-swap balances should mint positive liquidity"
+        );
+    }
+
+    function test_rangeRatioSwap_handlesPositiveLiquidityDustOnRequiredSide() public {
+        AerodromeRebalancerHarness harness = _deployHarness(safe, address(pool), address(gaugeMock), address(npm));
+
+        AerodromeRebalancer.RebalanceCtx memory ctx;
+        ctx.sqrtPriceX96 = TickMath.getSqrtRatioAtTick(-265764);
+        ctx.twapSqrtX96 = ctx.sqrtPriceX96;
+        ctx.newSqrtA = TickMath.getSqrtRatioAtTick(-265780);
+        ctx.newSqrtB = TickMath.getSqrtRatioAtTick(-265750);
+
+        uint256 b0 = 1_000;
+        uint256 b1 = 11_366_373;
+        uint128 preL = LiquidityAmounts.getLiquidityForAmounts(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1);
+        assertGt(preL, 0, "dust WETH should compute positive but tiny liquidity");
+
+        (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut) =
+            harness.exposedRangeRatioSwap(ctx, b0, b1);
+
+        assertTrue(shouldSwap, "should swap surplus cbBTC");
+        assertFalse(zeroForOne, "cbBTC -> WETH");
+        assertGt(amountIn, 0, "swap input");
+        assertGt(expectedOut, 0, "swap output");
+
+        b1 -= amountIn;
+        b0 += expectedOut;
+        assertGt(
+            LiquidityAmounts.getLiquidityForAmounts(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1),
+            preL,
+            "post-swap liquidity should improve"
         );
     }
 
@@ -534,12 +565,12 @@ contract AerodromeRebalancerHarness is AerodromeRebalancer {
         return ctx.valueAfter;
     }
 
-    function exposedZeroLiquiditySwap(RebalanceCtx memory ctx, uint256 b0, uint256 b1)
+    function exposedRangeRatioSwap(RebalanceCtx memory ctx, uint256 b0, uint256 b1)
         external
         pure
         returns (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut)
     {
-        return _zeroLiquiditySwap(ctx, b0, b1);
+        return _rangeRatioSwap(ctx, b0, b1);
     }
 }
 

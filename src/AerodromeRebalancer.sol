@@ -435,39 +435,17 @@ contract AerodromeRebalancer is ReentrancyGuard {
         uint256 b0 = ctx.amount0ToUse;
         uint256 b1 = ctx.amount1ToUse;
 
-        uint128 L = LiquidityAmounts.getLiquidityForAmounts(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1);
-        if (L == 0) {
-            (bool shouldSwap, bool swapZeroForOne, uint256 swapAmountIn,) = _zeroLiquiditySwap(ctx, b0, b1);
-            if (shouldSwap) {
-                _swapExact(
-                    ctx, swapZeroForOne ? TOKEN0 : TOKEN1, swapZeroForOne ? TOKEN1 : TOKEN0, swapAmountIn, deadline
-                );
-            }
-            return;
+        (bool shouldSwap, bool zeroForOne, uint256 amountIn,) = _rangeRatioSwap(ctx, b0, b1);
+        if (shouldSwap) {
+            _swapExact(ctx, zeroForOne ? TOKEN0 : TOKEN1, zeroForOne ? TOKEN1 : TOKEN0, amountIn, deadline);
         }
-        (uint256 req0, uint256 req1) =
-            LiquidityAmounts.getAmountsForLiquidity(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, L);
-
-        bool zeroForOne;
-        uint256 amountIn;
-        if (b0 > req0) {
-            zeroForOne = true;
-            amountIn = (b0 - req0) / 2;
-        } else if (b1 > req1) {
-            zeroForOne = false;
-            amountIn = (b1 - req1) / 2;
-        }
-        if (amountIn == 0) return;
-
-        _swapExact(ctx, zeroForOne ? TOKEN0 : TOKEN1, zeroForOne ? TOKEN1 : TOKEN0, amountIn, deadline);
     }
 
-    function _zeroLiquiditySwap(RebalanceCtx memory ctx, uint256 b0, uint256 b1)
+    function _rangeRatioSwap(RebalanceCtx memory ctx, uint256 b0, uint256 b1)
         internal
         pure
         returns (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut)
     {
-        // When one side is dust, the combined balances can still compute to L == 0.
         // Rebalance by value toward the token ratio implied by the new range.
         (uint256 ref0, uint256 ref1) =
             LiquidityAmounts.getAmountsForLiquidity(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, uint128(1e18));
@@ -502,6 +480,7 @@ contract AerodromeRebalancer is ReentrancyGuard {
         bool zeroForOne = tokenIn == TOKEN0;
         uint256 expectedOut =
             zeroForOne ? _token0ToToken1(amountIn, ctx.twapSqrtX96) : _token1ToToken0(amountIn, ctx.twapSqrtX96);
+        if (expectedOut == 0) return;
         uint256 minOut = expectedOut * (BPS_DENOM - maxSlippageBps) / BPS_DENOM;
 
         uint256 preIn = _safeBalance(tokenIn);
@@ -730,37 +709,19 @@ contract AerodromeRebalancer is ReentrancyGuard {
         b0 += a0;
         b1 += a1;
 
-        uint128 L = LiquidityAmounts.getLiquidityForAmounts(sqrtPriceX96, sqrtA, sqrtB, b0, b1);
         uint256 sim0 = b0;
         uint256 sim1 = b1;
-        if (L > 0) {
-            (uint256 req0, uint256 req1) = LiquidityAmounts.getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, L);
-            if (b0 > req0) {
-                r.zeroForOne = true;
-                r.amountIn = (b0 - req0) / 2;
-                r.expectedAmountOut = _token0ToToken1(r.amountIn, twapSqrtX96);
-                sim0 -= r.amountIn;
-                sim1 += r.expectedAmountOut;
-            } else if (b1 > req1) {
-                r.zeroForOne = false;
-                r.amountIn = (b1 - req1) / 2;
-                r.expectedAmountOut = _token1ToToken0(r.amountIn, twapSqrtX96);
-                sim1 -= r.amountIn;
-                sim0 += r.expectedAmountOut;
-            }
-        } else {
-            (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut) = _zeroLiquiditySwap(ctx, b0, b1);
-            if (shouldSwap) {
-                r.zeroForOne = zeroForOne;
-                r.amountIn = amountIn;
-                r.expectedAmountOut = expectedOut;
-                if (zeroForOne) {
-                    sim0 -= amountIn;
-                    sim1 += expectedOut;
-                } else {
-                    sim1 -= amountIn;
-                    sim0 += expectedOut;
-                }
+        (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut) = _rangeRatioSwap(ctx, b0, b1);
+        if (shouldSwap) {
+            r.zeroForOne = zeroForOne;
+            r.amountIn = amountIn;
+            r.expectedAmountOut = expectedOut;
+            if (zeroForOne) {
+                sim0 -= amountIn;
+                sim1 += expectedOut;
+            } else {
+                sim1 -= amountIn;
+                sim0 += expectedOut;
             }
         }
 
