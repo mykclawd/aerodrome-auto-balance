@@ -412,6 +412,64 @@ contract AerodromeRebalancerTest is Test {
         assertNotEq(spyNpm.lastAmount1Min(), twapA1 * 9950 / 10_000, "amount1Min should not use twap");
     }
 
+    function test_zeroLiquiditySwap_handlesDustOnRequiredSide() public {
+        AerodromeRebalancerHarness harness = _deployHarness(safe, address(pool), address(gaugeMock), address(npm));
+
+        AerodromeRebalancer.RebalanceCtx memory ctx;
+        ctx.sqrtPriceX96 = TickMath.getSqrtRatioAtTick(-265764);
+        ctx.twapSqrtX96 = ctx.sqrtPriceX96;
+        ctx.newSqrtA = TickMath.getSqrtRatioAtTick(-265780);
+        ctx.newSqrtB = TickMath.getSqrtRatioAtTick(-265750);
+
+        uint256 b0 = 27;
+        uint256 b1 = 11_366_373;
+        assertEq(
+            LiquidityAmounts.getLiquidityForAmounts(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1),
+            0,
+            "dust WETH should compute zero liquidity before swap"
+        );
+
+        (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut) =
+            harness.exposedZeroLiquiditySwap(ctx, b0, b1);
+
+        assertTrue(shouldSwap, "should swap surplus cbBTC");
+        assertFalse(zeroForOne, "cbBTC -> WETH");
+        assertGt(amountIn, 0, "swap input");
+        assertGt(expectedOut, 0, "swap output");
+
+        b1 -= amountIn;
+        b0 += expectedOut;
+        assertGt(
+            LiquidityAmounts.getLiquidityForAmounts(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1),
+            0,
+            "post-swap balances should mint positive liquidity"
+        );
+    }
+
+    function test_mintNewPosition_revertsBeforeNpmWhenExpectedLiquidityZero() public {
+        MockERC20 token0Mock = new MockERC20();
+        MockERC20 token1Mock = new MockERC20();
+        MinimalSafe safeMock = new MinimalSafe();
+        MockGauge gauge = new MockGauge();
+        MockPool spotPool = new MockPool(address(token0Mock), address(token1Mock), TICK_SPACING, address(gauge));
+        MintSpyNPM spyNpm = new MintSpyNPM(token0Mock, token1Mock, TICK_SPACING, -265850, -265820, 1e18);
+
+        AerodromeRebalancerHarness harness =
+            _deployHarness(address(safeMock), address(spotPool), address(gauge), address(spyNpm));
+        spotPool.setSlot0(TickMath.getSqrtRatioAtTick(-265764), -265764);
+
+        AerodromeRebalancer.RebalanceCtx memory ctx;
+        ctx.newLower = -265780;
+        ctx.newUpper = -265750;
+        ctx.newSqrtA = TickMath.getSqrtRatioAtTick(ctx.newLower);
+        ctx.newSqrtB = TickMath.getSqrtRatioAtTick(ctx.newUpper);
+        ctx.amount0ToUse = 27;
+        ctx.amount1ToUse = 11_366_373;
+
+        vm.expectRevert(AerodromeRebalancer.InvalidParam.selector);
+        harness.exposedMintNewPosition(ctx, block.timestamp + 1);
+    }
+
     function test_enforcePostInvariants_countsIdleSafeBalancesInValueAfter() public {
         MockERC20 token0Mock = new MockERC20();
         MockERC20 token1Mock = new MockERC20();
@@ -474,6 +532,14 @@ contract AerodromeRebalancerHarness is AerodromeRebalancer {
     function exposedEnforcePostInvariants(RebalanceCtx memory ctx) external view returns (uint256) {
         _enforcePostInvariants(ctx);
         return ctx.valueAfter;
+    }
+
+    function exposedZeroLiquiditySwap(RebalanceCtx memory ctx, uint256 b0, uint256 b1)
+        external
+        pure
+        returns (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut)
+    {
+        return _zeroLiquiditySwap(ctx, b0, b1);
     }
 }
 

@@ -437,25 +437,11 @@ contract AerodromeRebalancer is ReentrancyGuard {
 
         uint128 L = LiquidityAmounts.getLiquidityForAmounts(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1);
         if (L == 0) {
-            // One-sided balances use a reference range ratio rather than a hardcoded 50/50 split.
-            (uint256 ref0, uint256 ref1) =
-                LiquidityAmounts.getAmountsForLiquidity(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, uint128(1e18));
-            if (ref0 == 0 && ref1 == 0) return;
-            if (b0 == 0 && b1 > 0 && ref0 > 0) {
-                uint256 ref0In1 = _token0ToToken1(ref0, ctx.twapSqrtX96);
-                uint256 totalRefIn1 = ref0In1 + ref1;
-                if (totalRefIn1 == 0) return;
-                uint256 keep1 = FullMath.mulDiv(b1, ref1, totalRefIn1);
-                if (b1 > keep1) _swapExact(ctx, TOKEN1, TOKEN0, b1 - keep1, deadline);
-                return;
-            }
-            if (b1 == 0 && b0 > 0 && ref1 > 0) {
-                uint256 ref1In0 = _token1ToToken0(ref1, ctx.twapSqrtX96);
-                uint256 totalRefIn0 = ref0 + ref1In0;
-                if (totalRefIn0 == 0) return;
-                uint256 keep0 = FullMath.mulDiv(b0, ref0, totalRefIn0);
-                if (b0 > keep0) _swapExact(ctx, TOKEN0, TOKEN1, b0 - keep0, deadline);
-                return;
+            (bool shouldSwap, bool swapZeroForOne, uint256 swapAmountIn,) = _zeroLiquiditySwap(ctx, b0, b1);
+            if (shouldSwap) {
+                _swapExact(
+                    ctx, swapZeroForOne ? TOKEN0 : TOKEN1, swapZeroForOne ? TOKEN1 : TOKEN0, swapAmountIn, deadline
+                );
             }
             return;
         }
@@ -474,6 +460,38 @@ contract AerodromeRebalancer is ReentrancyGuard {
         if (amountIn == 0) return;
 
         _swapExact(ctx, zeroForOne ? TOKEN0 : TOKEN1, zeroForOne ? TOKEN1 : TOKEN0, amountIn, deadline);
+    }
+
+    function _zeroLiquiditySwap(RebalanceCtx memory ctx, uint256 b0, uint256 b1)
+        internal
+        pure
+        returns (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut)
+    {
+        // When one side is dust, the combined balances can still compute to L == 0.
+        // Rebalance by value toward the token ratio implied by the new range.
+        (uint256 ref0, uint256 ref1) =
+            LiquidityAmounts.getAmountsForLiquidity(ctx.sqrtPriceX96, ctx.newSqrtA, ctx.newSqrtB, uint128(1e18));
+        if (ref0 == 0 || ref1 == 0) return (false, false, 0, 0);
+
+        uint256 ref0In1 = _token0ToToken1(ref0, ctx.twapSqrtX96);
+        uint256 totalRefIn1 = ref0In1 + ref1;
+        if (totalRefIn1 == 0) return (false, false, 0, 0);
+
+        uint256 totalIn1 = b1 + _token0ToToken1(b0, ctx.twapSqrtX96);
+        if (totalIn1 == 0) return (false, false, 0, 0);
+
+        uint256 target1 = FullMath.mulDiv(totalIn1, ref1, totalRefIn1);
+        if (b1 > target1) {
+            amountIn = b1 - target1;
+            expectedOut = _token1ToToken0(amountIn, ctx.twapSqrtX96);
+            return (expectedOut > 0, false, amountIn, expectedOut);
+        }
+
+        uint256 missing1 = target1 - b1;
+        amountIn = _token1ToToken0(missing1, ctx.twapSqrtX96);
+        if (amountIn > b0) amountIn = b0;
+        expectedOut = _token0ToToken1(amountIn, ctx.twapSqrtX96);
+        return (amountIn > 0 && expectedOut > 0, true, amountIn, expectedOut);
     }
 
     function _swapExact(RebalanceCtx memory ctx, address tokenIn, address tokenOut, uint256 amountIn, uint256 deadline)
@@ -526,6 +544,7 @@ contract AerodromeRebalancer is ReentrancyGuard {
         (uint160 spotSqrtX96,,,,,) = ICLPool(POOL).slot0();
         uint160 mintSqrtX96 = _clampSqrtToRange(spotSqrtX96, ctx.newSqrtA, ctx.newSqrtB);
         uint128 expectedL = LiquidityAmounts.getLiquidityForAmounts(mintSqrtX96, ctx.newSqrtA, ctx.newSqrtB, b0, b1);
+        if (expectedL == 0) revert InvalidParam();
         (uint256 expA0, uint256 expA1) =
             LiquidityAmounts.getAmountsForLiquidity(mintSqrtX96, ctx.newSqrtA, ctx.newSqrtB, expectedL);
         uint256 a0Min = expA0 * (BPS_DENOM - maxSlippageBps) / BPS_DENOM;
@@ -696,6 +715,11 @@ contract AerodromeRebalancer is ReentrancyGuard {
         uint160 sqrtA = TickMath.getSqrtRatioAtTick(r.newLower);
         uint160 sqrtB = TickMath.getSqrtRatioAtTick(r.newUpper);
         uint160 twapSqrtX96 = TickMath.getSqrtRatioAtTick(r.twapTick);
+        RebalanceCtx memory ctx;
+        ctx.sqrtPriceX96 = sqrtPriceX96;
+        ctx.twapSqrtX96 = twapSqrtX96;
+        ctx.newSqrtA = sqrtA;
+        ctx.newSqrtB = sqrtB;
 
         uint256 b0 = IERC20Minimal(TOKEN0).balanceOf(SAFE);
         uint256 b1 = IERC20Minimal(TOKEN1).balanceOf(SAFE);
@@ -707,17 +731,43 @@ contract AerodromeRebalancer is ReentrancyGuard {
         b1 += a1;
 
         uint128 L = LiquidityAmounts.getLiquidityForAmounts(sqrtPriceX96, sqrtA, sqrtB, b0, b1);
+        uint256 sim0 = b0;
+        uint256 sim1 = b1;
         if (L > 0) {
             (uint256 req0, uint256 req1) = LiquidityAmounts.getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, L);
             if (b0 > req0) {
                 r.zeroForOne = true;
                 r.amountIn = (b0 - req0) / 2;
                 r.expectedAmountOut = _token0ToToken1(r.amountIn, twapSqrtX96);
+                sim0 -= r.amountIn;
+                sim1 += r.expectedAmountOut;
             } else if (b1 > req1) {
                 r.zeroForOne = false;
                 r.amountIn = (b1 - req1) / 2;
                 r.expectedAmountOut = _token1ToToken0(r.amountIn, twapSqrtX96);
+                sim1 -= r.amountIn;
+                sim0 += r.expectedAmountOut;
             }
+        } else {
+            (bool shouldSwap, bool zeroForOne, uint256 amountIn, uint256 expectedOut) = _zeroLiquiditySwap(ctx, b0, b1);
+            if (shouldSwap) {
+                r.zeroForOne = zeroForOne;
+                r.amountIn = amountIn;
+                r.expectedAmountOut = expectedOut;
+                if (zeroForOne) {
+                    sim0 -= amountIn;
+                    sim1 += expectedOut;
+                } else {
+                    sim1 -= amountIn;
+                    sim0 += expectedOut;
+                }
+            }
+        }
+
+        uint160 mintSqrtX96 = _clampSqrtToRange(sqrtPriceX96, sqrtA, sqrtB);
+        if (LiquidityAmounts.getLiquidityForAmounts(mintSqrtX96, sqrtA, sqrtB, sim0, sim1) == 0) {
+            r.reason = InvalidParam.selector;
+            return r;
         }
         r.canRebalance = true;
     }
